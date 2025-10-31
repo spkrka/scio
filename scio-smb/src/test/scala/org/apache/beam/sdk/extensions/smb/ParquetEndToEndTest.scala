@@ -171,7 +171,7 @@ class ParquetEndToEndTest extends PipelineSpec {
         ParquetAvroSortedBucketIO
           .read(new TupleTag[GenericRecord]("rhs"), userSchema)
           .from(usersDir.toString)
-      )(Coder[String], avroEventCoder, avroUserCoder)
+      )(Coder[String], scala.reflect.classTag[String], avroEventCoder, avroUserCoder)
     val userMap = avroUsers.groupBy(_.get("name").toString).view.mapValues(_.head).toMap
     val expected = avroEvents.groupBy(_.get("user").toString).toSeq.flatMap { case (k, es) =>
       es.map(e => (k, (e, userMap(k))))

@@ -38,6 +38,7 @@ import org.apache.beam.sdk.extensions.smb.BucketMetadata.HashType;
 import org.apache.beam.sdk.extensions.smb.SortedBucketSource.Predicate;
 import org.apache.beam.sdk.extensions.smb.SortedBucketTransform.NewBucketMetadataFn;
 import org.apache.beam.sdk.io.FileSystems;
+import org.apache.beam.sdk.io.PatchedSerializableAvroCodecFactory;
 import org.apache.beam.sdk.io.fs.ResourceId;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableList;
@@ -160,7 +161,7 @@ public class AvroSortedBucketIO {
     return new AutoValue_AvroSortedBucketIO_TransformOutput.Builder<K1, K2, GenericRecord>()
         .setFilenameSuffix(DEFAULT_SUFFIX)
         .setFilenamePrefix(SortedBucketIO.DEFAULT_FILENAME_PREFIX)
-        .setCodec(AvroFileOperations.defaultCodec())
+        .setSerializableCodec(new PatchedSerializableAvroCodecFactory(AvroFileOperations.defaultCodec()))
         .setKeyClassPrimary(keyClassPrimary)
         .setKeyClassSecondary(keyClassSecondary)
         .setKeyFieldPrimary(keyFieldPrimary)
@@ -187,7 +188,7 @@ public class AvroSortedBucketIO {
     return new AutoValue_AvroSortedBucketIO_TransformOutput.Builder<K1, K2, T>()
         .setFilenameSuffix(DEFAULT_SUFFIX)
         .setFilenamePrefix(SortedBucketIO.DEFAULT_FILENAME_PREFIX)
-        .setCodec(AvroFileOperations.defaultCodec())
+        .setSerializableCodec(new PatchedSerializableAvroCodecFactory(AvroFileOperations.defaultCodec()))
         .setKeyClassPrimary(keyClassPrimary)
         .setKeyClassSecondary(keyClassSecondary)
         .setKeyFieldPrimary(keyFieldPrimary)
@@ -462,7 +463,13 @@ public class AvroSortedBucketIO {
     @Nullable
     abstract AvroDatumFactory<T> getDatumFactory();
 
-    abstract CodecFactory getCodec();
+    // Internal: Use getSerializableCodec() which wraps CodecFactory for serialization
+    abstract PatchedSerializableAvroCodecFactory getSerializableCodec();
+
+    // Public API: Returns unwrapped CodecFactory for backward compatibility
+    public CodecFactory getCodec() {
+      return getSerializableCodec().getCodec();
+    }
 
     abstract Builder<K1, K2, T> toBuilder();
 
@@ -489,7 +496,7 @@ public class AvroSortedBucketIO {
 
       abstract Builder<K1, K2, T> setDatumFactory(AvroDatumFactory<T> datumFactory);
 
-      abstract Builder<K1, K2, T> setCodec(CodecFactory codec);
+      abstract Builder<K1, K2, T> setSerializableCodec(PatchedSerializableAvroCodecFactory codec);
 
       abstract TransformOutput<K1, K2, T> build();
     }
@@ -525,7 +532,7 @@ public class AvroSortedBucketIO {
 
     /** Specifies the output file {@link CodecFactory}. */
     public TransformOutput<K1, K2, T> withCodec(CodecFactory codec) {
-      return toBuilder().setCodec(codec).build();
+      return toBuilder().setSerializableCodec(new PatchedSerializableAvroCodecFactory(codec)).build();
     }
 
     @SuppressWarnings("unchecked")
