@@ -187,12 +187,131 @@ base.map(_.field2).saveAsSortedBucket(out2)
 
 **Potential repos**: Need broader search to find multi-output patterns
 
+### Multi-Output Candidates (HIGHEST VALUE!)
+
+Using MCP code-search, identified repos with multiple `saveAsSortedBucket` calls from same source:
+
+#### 3. adventure/adventure-log-reader - CRITICAL PERFORMANCE WIN
+
+**Current Pattern**: Writing same data to Avro AND Parquet SMB outputs
+
+**Code location**: `adventure-log-reader/src/main/scala/com/spotify/adventure/logreader/AdUserBucket.scala`
+
+**Current Implementation** (lines 54-75):
+```scala
+source  // Same SCollection used twice!
+  .tap(_ => Metrics.outputCount.inc())
+  .saveAsSortedBucket(  // ❌ Shuffle #1
+    AvroSortedBucketIO.write(...).to(args("output"))
+  )
+
+source  // Re-using same source
+  .saveAsSortedBucket(  // ❌ Shuffle #2 (redundant!)
+    ParquetAvroSortedBucketIO.write(...).to(args("parquet_output"))
+  )
+```
+
+**Problem**: **TWO GroupByKey shuffles** for the same data!
+
+**Migration to Fluent API**:
+```scala
+// FUTURE: When SCollection → SMBCollection support is added
+val smbData = SMBCollection.fromSCollection(
+  source,
+  classOf[CharSequence],
+  _.get("adUserId"),
+  numBuckets = numBuckets,
+  numShards = numShards
+)
+
+// ✅ Single shuffle, multiple outputs!
+smbData.saveAsSortedBucket(avroOutput)      // Reuses shuffle
+smbData.saveAsSortedBucket(parquetOutput)   // Reuses shuffle
+
+sc.run()  // Only ONE GroupByKey!
+```
+
+**Performance Impact**:
+- **Before**: Read source + 2× GroupByKey shuffle + 2× write = ~3× data volume
+- **After**: Read source + 1× GroupByKey shuffle + 2× write = ~2× data volume
+- **Savings**: ~33% cost reduction!
+
+**Also applies to**: `ImpressionsBucket.scala` in same repo
+
+---
+
+#### 4. creator/fanatic-segments-pipelines - MULTI-OUTPUT FROM TRANSFORM
+
+**Current Pattern**: Multiple derived outputs from expensive aggregation
+
+**Code location**: `fanatic-segments-pipelines/.../ArtistSegmentsAggregationJobTask.scala`
+
+**Current Implementation** (lines 326-370):
+```scala
+val output = pipeline(segments)  // Expensive aggregation
+
+output.saveAsSortedBucket(fullSegmentsOutput)  // ❌ Shuffle #1
+
+output.map(removeSketchesFromSegment)          // Derived output
+  .saveAsSortedBucket(noSketchesOutput)        // ❌ Shuffle #2
+```
+
+**Problem**: **TWO GroupByKey shuffles** for derived outputs from same computation!
+
+**Migration to Fluent API**:
+```scala
+// FUTURE: When SCollection → SMBCollection support is added
+val base = SMBCollection.fromSCollection(
+  pipeline(segments),  // Expensive computation runs ONCE
+  classOf[String],
+  _.get("artist_country_key"),
+  numBuckets = 2048
+)
+
+// ✅ Both outputs share single shuffle!
+base.saveAsSortedBucket(fullSegmentsOutput)
+base.map(removeSketchesFromSegment).saveAsSortedBucket(noSketchesOutput)
+
+sc.run()  // Single shuffle, both outputs
+```
+
+**Performance Impact**:
+- **Before**: Expensive agg + 2× GroupByKey + 2× write
+- **After**: Expensive agg + 1× GroupByKey + 2× write
+- **Savings**: 1 shuffle eliminated (~TB-scale data)
+
+---
+
+### MCP Code-Search Results Summary
+
+**Total findings**:
+- `sortMergeTransform`: **77 matches across 27 repositories**
+- `saveAsSortedBucket`: **84 matches across 30+ repositories**
+
+**Repository categories**:
+
+1. **Heavy SMB Transform Users** (high value for fluent API syntax):
+   - `datainfra/ubi-pipelines` - 5 files
+   - `key-metrics/key-metrics-pipelines` - 8 files
+   - `live-mountain/gigatron-core-pipelines` - 8 files
+   - `datasets-segmentation/content-creator-data-scio` - 9 files
+   - `listening-aggregates/dawnshard` - 10 usage points in single file
+
+2. **Multi-Output Patterns** (HIGHEST value - zero-shuffle optimization):
+   - `adventure/adventure-log-reader` - Dual Avro/Parquet outputs
+   - `creator/fanatic-segments-pipelines` - Derived outputs from aggregations
+   - Likely more candidates in: `daim/insights-pipelines` (7 files)
+
+3. **Single-Output Users** (lower priority):
+   - 20+ repos with standard SMB write patterns
+   - Benefit: Better syntax, but no performance win
+
 ### Next Steps
 
-1. **Reach out to MCP code-search** for broader analysis
-   - Search for: multiple `sortMergeTransform` calls on same inputs
-   - Search for: `sortMergeJoin` followed by multiple `saveAsSortedBucket`
-   - Identify repos with multi-output SMB patterns (highest performance impact)
+1. **Prioritize SCollection → SMBCollection feature**
+   - This unlocks the biggest performance wins (multi-output zero-shuffle)
+   - Found concrete candidates: adventure-log-reader, fanatic-segments-pipelines
+   - Estimated impact: 30-50% cost reduction for multi-output pipelines
 
 2. **Create migration guide** for common patterns
    - Simple transform migration
