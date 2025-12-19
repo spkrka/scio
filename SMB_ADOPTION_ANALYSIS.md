@@ -334,11 +334,132 @@ Based on limited local search:
 
 ---
 
+## Ergonomic Improvements (Current Fluent API)
+
+The current SMBCollection PR (reading from SMB files) provides immediate ergonomic value beyond future performance wins.
+
+### Pattern: sortMergeJoin + .values + .map → Fluent API
+
+Found across multiple repos using SMB joins for decryption/enrichment:
+
+#### Example 1: user-fraud-detection-scio
+
+**Current** (`SSACFSDataLoadingJob.scala`):
+```scala
+val joinedData = sc.sortMergeJoin(
+  classOf[String],
+  ssac,
+  keymapping,
+  TargetParallelism.max()
+)
+
+joinedData
+  .values  // ❌ Need .values to unwrap
+  .map { case (signupServiceAccountCreation, keymapping) =>
+    SSACFS.fromAvro(signupServiceAccountCreation, keymapping)
+  }
+```
+
+**With Fluent API**:
+```scala
+SMBCollection.cogroup2(
+  classOf[String],
+  ssac,
+  keymapping,
+  TargetParallelism.max()
+)
+  .map { case (_, (ssac, keymapping)) =>  // ✅ Direct functional pipeline
+    SSACFS.fromAvro(ssac, keymapping)
+  }
+  .toSCollectionAndSeal()
+```
+
+**Benefits**:
+- ✅ Cleaner - no `.values` step
+- ✅ More composable - standard `map`/`filter`/`flatMap` operations
+- ✅ Better type inference - direct tuple destructuring
+
+#### Example 2: searchrank-pipeline
+
+**Current** (`TfFlatExamplesJob.scala` lines 113-123):
+```scala
+sc.sortMergeJoin(
+  classOf[String],
+  encryptedSamples,
+  keychains,
+  targetParallelism = TargetParallelism.max()
+).values
+  .map { case (sample, keychain) => Decrypters.decrypt(keychain, sample) }
+```
+
+**With Fluent API**:
+```scala
+SMBCollection.cogroup2(
+  classOf[String],
+  encryptedSamples,
+  keychains,
+  TargetParallelism.max()
+)
+  .map { case (_, (sample, keychain)) =>
+    Decrypters.decrypt(keychain, sample)
+  }
+  .toSCollectionAndSeal()
+```
+
+**Pattern found in**:
+- `searchrank-pipeline` - TfFlatExamplesJob, TfFlatExamplesV2Job, ExampleListWithContextJob
+- `search-metrics-v2` - SuccessMetricsV3Job, SearchSequenceV2LongTermJob
+- `searchrank-lpm-pipelines` - TrainingCandidatesDataJobTask
+- `library-tags/tags-data` - UserFilterTask
+- `gen-recs-data-pipelines` - TrainingDataJobTask
+
+**Repos affected**: ~10 search/ML repos with SMB join + decrypt pattern
+
+---
+
+### Pattern: sortMergeTransform with Callbacks → Functional Style
+
+Heavy users of imperative callback pattern (identified earlier):
+
+**Repos**:
+- `datainfra/ubi-pipelines` - 5 files (impressions/interactions)
+- `key-metrics/key-metrics-pipelines` - 8 files
+- `gigatron-core-pipelines` - 8 files
+- `content-creator-data-scio` - 9 files
+
+**Common Pattern**:
+```scala
+// Traditional - imperative
+sc.sortMergeTransform(...).via {
+  case (key, values, outputCollector) =>
+    values.foreach(v => outputCollector.accept(transform(v)))
+}
+
+// Fluent - functional
+SMBCollection.read(...).flatMap(values => values.map(transform))
+```
+
+**Value**: Better Scala idioms, more composable, easier to test
+
+---
+
 ## How to Use This Analysis
 
 For SMBCollection PR reviewers and adopters:
 
-1. **Syntax improvements are universal** - Any `sortMergeTransform` benefits from functional style
-2. **Performance wins are selective** - Multi-output patterns see massive gains
-3. **Migration is additive** - Can adopt incrementally, no breaking changes to existing code
+### Current PR Value (SMBCollection from SMB files):
+
+1. **Ergonomic wins are broad** - ~15-20 repos benefit from cleaner join + transform patterns
+2. **Syntax improvements for transforms** - Heavy users (UBI, key-metrics, gigatron) get functional style
+3. **Migration is easy** - Drop-in replacement for `sortMergeJoin` → `SMBCollection.cogroup2`
+
+### Future Enhancement Value (SCollection → SMBCollection):
+
+1. **Performance wins are selective but massive** - Multi-output patterns see 30-50% cost reduction
+2. **Concrete candidates identified** - adventure-log-reader, fanatic-segments-pipelines
+3. **Requires new design** - As discussed in exploration branch
+
+**Recommendation**:
+- **Ship current PR** for ergonomic improvements across ~20 repos
+- **Follow up with SCollection → SMBCollection** for performance wins in identified multi-output cases
 
