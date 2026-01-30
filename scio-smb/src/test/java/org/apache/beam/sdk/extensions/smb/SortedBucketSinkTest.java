@@ -27,6 +27,7 @@ import java.nio.channels.Channels;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -385,7 +386,7 @@ public class SortedBucketSinkTest {
 
   static void check(
       WriteResult writeResult,
-      BucketMetadata<String, ?, String> metadata,
+      BucketMetadata<?, ?, String> metadata,
       Consumer<Map<BucketShardId, List<String>>> checkFn) {
     @SuppressWarnings("unchecked")
     final PCollection<ResourceId> writtenMetadata =
@@ -539,5 +540,124 @@ public class SortedBucketSinkTest {
           "Written bucketShardIds did not match metadata",
           writtenBuckets.keySet().containsAll(metadata.getAllBucketShardIds()));
     };
+  }
+
+  /**
+   * Test secondary key ordering with variable-length CharSequence strings.
+   *
+   * <p>This test exposes a bug where CharSequence secondary keys are encoded using StringUtf8Coder
+   * which adds a VarInt length prefix. When strings have different lengths, the length prefix
+   * affects byte ordering, causing incorrect sort order.
+   *
+   * <p>For example, with VarInt prefix:
+   * - "Alpha" (length 5) encodes as [5]['A']['l']['p']['h']['a']
+   * - "Beta" (length 4) encodes as [4]['B']['e']['t']['a']
+   * - Byte comparison: 5 > 4, so "Alpha" > "Beta" (WRONG!)
+   *
+   * <p>This bug doesn't affect equal-length strings (like "a01", "a02" used in other tests) because
+   * the VarInt prefix is identical.
+   *
+   * <p>Uses format "Primary:Secondary" where Primary is 1 char, Secondary is variable length.
+   */
+  @Test
+  @Category(NeedsRunner.class)
+  public void testSecondaryKeyOrderingWithVariableLengthStrings() throws Exception {
+    // Input with different-length secondary keys using format "Primary:Secondary"
+    // Primary key: before colon, Secondary key: after colon (variable length)
+    final String[] variableLengthInput = {
+      "A:Zeta", // primary=A, secondary=Zeta (4 chars)
+      "A:Alpha", // primary=A, secondary=Alpha (5 chars)
+      "A:Beta", // primary=A, secondary=Beta (4 chars)
+      "B:Gamma", // primary=B, secondary=Gamma (5 chars)
+      "B:A", // primary=B, secondary=A (1 char)
+      "B:Delta" // primary=B, secondary=Delta (5 chars)
+    };
+
+    final TestBucketMetadataCharSequenceKeys metadata =
+        TestBucketMetadataCharSequenceKeys.of(2, 1);
+
+    final SortedBucketSink<CharSequence, CharSequence, String> sink =
+        new SortedBucketSink<>(
+            metadata,
+            fromFolder(output),
+            fromFolder(temp),
+            ".txt",
+            new TestFileOperations(),
+            1,
+            0);
+
+    check(
+        pipeline.apply("VariableLengthTest", Create.of(Arrays.asList(variableLengthInput))).apply(sink),
+        metadata,
+        new VariableLengthSecondaryKeyVerifier(metadata));
+
+    pipeline.run();
+  }
+
+  /** Serializable consumer to verify variable-length secondary key ordering. */
+  static class VariableLengthSecondaryKeyVerifier implements SerializableConsumer<Map<BucketShardId, List<String>>> {
+    private final TestBucketMetadataCharSequenceKeys metadata;
+
+    VariableLengthSecondaryKeyVerifier(TestBucketMetadataCharSequenceKeys metadata) {
+      this.metadata = metadata;
+    }
+
+    @Override
+    public void accept(Map<BucketShardId, List<String>> writtenBuckets) {
+      // Collect all records sorted by their actual position in files
+      final List<String> allRecords = new ArrayList<>();
+      writtenBuckets.forEach(
+          (bucketShardId, records) -> {
+            allRecords.addAll(records);
+          });
+
+      // Verify secondary key ordering within same primary key
+      CharSequence prevPrimary = null;
+      CharSequence prevSecondary = null;
+
+      for (String record : allRecords) {
+        CharSequence primary = metadata.extractKeyPrimary(record);
+        CharSequence secondary = metadata.extractKeySecondary(record);
+
+        if (prevPrimary != null && prevPrimary.toString().equals(primary.toString())) {
+          // Same primary key - verify secondary key is in ascending order
+          Assert.assertTrue(
+              String.format(
+                  "Secondary keys must be in ascending order. "
+                      + "Previous: (%s, %s), Current: (%s, %s)",
+                  prevPrimary, prevSecondary, primary, secondary),
+              prevSecondary == null
+                  || secondary == null
+                  || prevSecondary.toString().compareTo(secondary.toString()) <= 0);
+        }
+
+        prevPrimary = primary;
+        prevSecondary = secondary;
+      }
+
+      // Explicitly verify expected order for primary key "A"
+      final List<String> recordsForKeyA =
+          allRecords.stream()
+              .filter(r -> "A".equals(metadata.extractKeyPrimary(r).toString()))
+              .collect(Collectors.toList());
+
+      Assert.assertEquals("Should have 3 records with primary key 'A'", 3, recordsForKeyA.size());
+      // Expected order by secondary key: Alpha < Beta < Zeta (lexicographic)
+      Assert.assertEquals("First record should be A:Alpha", "A:Alpha", recordsForKeyA.get(0));
+      Assert.assertEquals("Second record should be A:Beta", "A:Beta", recordsForKeyA.get(1));
+      Assert.assertEquals("Third record should be A:Zeta", "A:Zeta", recordsForKeyA.get(2));
+
+      // Explicitly verify expected order for primary key "B"
+      final List<String> recordsForKeyB =
+          allRecords.stream()
+              .filter(r -> "B".equals(metadata.extractKeyPrimary(r).toString()))
+              .collect(Collectors.toList());
+
+      Assert.assertEquals("Should have 3 records with primary key 'B'", 3, recordsForKeyB.size());
+      // Expected order by secondary key: A < Delta < Gamma (lexicographic)
+      Assert.assertEquals("First record should be B:A", "B:A", recordsForKeyB.get(0));
+      Assert.assertEquals("Second record should be B:Delta", "B:Delta", recordsForKeyB.get(1));
+      Assert.assertEquals("Third record should be B:Gamma", "B:Gamma", recordsForKeyB.get(2));
+    }
   }
 }
