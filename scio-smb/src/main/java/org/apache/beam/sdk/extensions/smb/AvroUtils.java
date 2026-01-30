@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.Map;
 import org.apache.avro.Schema;
@@ -199,6 +200,25 @@ class AvroUtils {
     }
   }
 
+  /**
+   * Coder for CharSequence that encodes as raw UTF-8 bytes without length prefix.
+   *
+   * <p>This is critical for correct lexicographic sorting. StringUtf8Coder adds a VarInt
+   * length prefix which causes incorrect byte-level comparisons when strings have different
+   * lengths.
+   *
+   * <p>Example of the bug with VarInt prefix:
+   * - "Alpha" (5 chars) → [5]['A']['l']['p']['h']['a']
+   * - "Beta"  (4 chars) → [4]['B']['e']['t']['a']
+   * - Byte comparison: 5 > 4, so "Alpha" > "Beta" (WRONG!)
+   *
+   * <p>With raw UTF-8 encoding (this implementation):
+   * - "Alpha" → ['A']['l']['p']['h']['a']
+   * - "Beta"  → ['B']['e']['t']['a']
+   * - Byte comparison: 'A' < 'B', so "Alpha" < "Beta" (CORRECT!)
+   *
+   * <p>This matches the behavior of IcebergEncoder for String keys.
+   */
   private static class CharSequenceCoder extends AtomicCoder<CharSequence> {
     private static final CharSequenceCoder INSTANCE = new CharSequenceCoder();
 
@@ -211,12 +231,15 @@ class AvroUtils {
     @Override
     public void encode(CharSequence value, OutputStream outStream)
         throws CoderException, IOException {
-      StringUtf8Coder.of().encode(value.toString(), outStream);
+      // Use raw UTF-8 bytes without VarInt length prefix for correct lexicographic sorting
+      outStream.write(value.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     @Override
     public CharSequence decode(InputStream inStream) throws CoderException, IOException {
-      return StringUtf8Coder.of().decode(inStream);
+      // Read all remaining bytes and decode as UTF-8
+      byte[] bytes = inStream.readAllBytes();
+      return new String(bytes, StandardCharsets.UTF_8);
     }
   }
 }
